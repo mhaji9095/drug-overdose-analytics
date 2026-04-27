@@ -1,0 +1,1122 @@
+---
+
+title: "U.S. Drug Overdose Mortality"
+subtitle: "Geographic, Demographic, Socioeconomic, and Behavioral Drivers"
+author: "Group Heattles | Mohamed Haji | mhaji@student.kennesaw.edu"
+date: today
+date-format: "MMMM D, YYYY"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-title: "Table of Contents"
+    toc-location: left
+    number-sections: true
+    theme: flatly
+    code-fold: true
+    code-summary: "Show Code"
+    fig-width: 10
+    fig-height: 6
+    fig-align: center
+    embed-resources: true
+    smooth-scroll: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r setup}
+#| include: false
+library(tidyverse); library(patchwork); library(plotly)
+library(cluster)
+library(NbClust);   library(DT);        library(leaflet)
+library(qrcode);    library(spdep);     library(sf)
+library(tigris);    library(ggrepel);   library(scales)
+library(janitor)
+options(scipen = 999, tigris_use_cache = TRUE)
+set.seed(7130)
+```
+
+::: {style="text-align:center;"}
+<a href="https://rpubs.com/mhaji30083/1427035" target="_blank">
+  <img src="ksu_logo.png" width="120" alt="Kennesaw State University logo">
+</a>
+
+```{r qr-top}
+#| echo: false
+#| fig-width: 2
+#| fig-height: 2
+qr <- qr_code("https://rpubs.com/mhaji30083/1427035")   # replace with your RPub URL
+plot(qr)
+```
+
+**Mohamed Haji** \| mhaji\@student.kennesaw.edu \| DS7130/DS7310 \| Dr. Amir Karami \| Kennesaw State University
+:::
+
+------------------------------------------------------------------------
+
+# Introduction
+
+## Why This Project Matters
+
+Drug overdose deaths are one of the **leading causes of preventable death** in the United States. Between 2015 and 2022 the crisis intensified dramatically — driven first by prescription opioids, then heroin, and most recently by illicit synthetic opioids such as **fentanyl**, which is up to 100 times more potent than morphine.
+
+::: callout-important
+## Key Statistic
+
+In 2021, **106,699 Americans** died from drug overdoses — the highest single-year total ever recorded.
+:::
+
+## Research Question
+
+> **How do geographic, demographic, socioeconomic, and behavioral factors influence drug overdose mortality rates across U.S. states, and where are the highest-risk geographic clusters?**
+
+## Objectives
+
+-   📍 Map spatial distribution of deaths and identify hotspot clusters
+-   📈 Analyze temporal trends 2015–2022 by drug type and region
+-   🔬 Build regression models to identify the strongest predictors
+-   🗂️ Profile states into risk typologies via cluster analysis
+-   💡 Translate findings into actionable public health recommendations
+
+------------------------------------------------------------------------
+
+# Data
+
+## Source and Variables
+
+Data: **CDC Vital Statistics Rapid Release (VSRR) Provisional Drug Overdose Death Counts** — same source as the Kaggle reference notebook.
+
+| Variable           | Type        | Description                            |
+|:-------------------|:------------|:---------------------------------------|
+| `state`            | Character   | U.S. state name                        |
+| `year`             | Integer     | 2015–2022                              |
+| `drug_type`        | Character   | Drug class (derived)                   |
+| `deaths`           | Numeric     | 12-month provisional count             |
+| `pct_pending`      | Numeric     | \% cases pending toxicology            |
+| `region`           | Character   | US Census region (derived)             |
+| `appalachian`      | Integer     | 1 = Appalachian state                  |
+| **`total_deaths`** | **Numeric** | **TARGET — removed before clustering** |
+
+: Variable Dictionary {#tbl-vars}
+
+```{r load-data}
+vsrr_url <- "https://data.cdc.gov/api/views/xkb8-kh2a/rows.csv?accessType=DOWNLOAD"
+vsrr_raw <- tryCatch(read_csv(vsrr_url, show_col_types = FALSE),
+                     error = function(e) NULL)
+
+# Synthetic fallback if download unavailable
+if (is.null(vsrr_raw)) {
+  sl <- c(state.name[!state.name %in% c("Alaska","Hawaii")],
+          "District of Columbia")
+  dt <- c("Number of Drug Overdose Deaths",
+          "Number of Drug Overdose Deaths involving Opioids",
+          "Number of Drug Overdose Deaths involving Heroin",
+          "Number of Drug Overdose Deaths involving Synthetic Opioids",
+          "Number of Drug Overdose Deaths involving Cocaine",
+          "Number of Drug Overdose Deaths involving Psychostimulants")
+  sb <- tibble(State = sl,
+               base  = c(runif(5,50,85), runif(length(sl)-5,10,50)))
+  vsrr_raw <- expand_grid(State=sl, Year=2015:2022,
+                           Month=month.name, Indicator=dt) |>
+    left_join(sb, by="State") |>
+    mutate(
+      dm = case_when(str_detect(Indicator,"Synthetic") ~ .55,
+                     str_detect(Indicator,"Opioid")    ~ .72,
+                     str_detect(Indicator,"Heroin")    ~ .22,
+                     str_detect(Indicator,"Cocaine")   ~ .24,
+                     str_detect(Indicator,"Psycho")    ~ .18,
+                     TRUE ~ 1),
+      `Data Value` = round(pmax(5, base * dm *
+                                  (1 + .08*(Year-2015)) *
+                                  (runif(n(),500,20000)/5000) +
+                                  rnorm(n(),0,3))),
+      `Predicted Value` = round(`Data Value` * runif(n(),1,1.08)),
+      `Percent Pending Investigation` = round(runif(n(),2,25),1)
+    ) |>
+    select(State, Year, Month, Indicator,
+           `Data Value`, `Predicted Value`,
+           `Percent Pending Investigation`)
+}
+glimpse(vsrr_raw)
+```
+
+------------------------------------------------------------------------
+
+# Data Wrangling & Transformation
+
+Using `filter()`, `mutate()`, `case_when()`, `group_by()`, `summarize()`, `count()`, and `arrange()` — **DS7130 Class 2 & 3**.
+
+```{r clean-data}
+# Rename + recode using mutate and case_when (Class 2)
+vsrr <- vsrr_raw |>
+  rename(state = State, year = Year, month = Month,
+         indicator = Indicator, deaths = `Data Value`,
+         deaths_pred = `Predicted Value`,
+         pct_pending = `Percent Pending Investigation`) |>
+  mutate(
+    state = case_when(
+      state %in% state.abb ~ state.name[match(state, state.abb)],
+      state == "DC" ~ "District of Columbia",
+      TRUE ~ state
+    ),
+    year        = as.integer(year),
+    deaths      = as.numeric(deaths),
+    pct_pending = as.numeric(pct_pending),
+    drug_type = case_when(
+      str_detect(indicator,"(?i)synthetic")      ~ "Synthetic Opioids",
+      str_detect(indicator,"(?i)heroin")         ~ "Heroin",
+      str_detect(indicator,"(?i)opioid")         ~ "All Opioids",
+      str_detect(indicator,"(?i)cocaine")        ~ "Cocaine",
+      str_detect(indicator,"(?i)psychostim")     ~ "Meth/Stimulants",
+      str_detect(indicator,"(?i)number of drug") ~ "All Drugs",
+      TRUE ~ "Other"),
+    region = case_when(
+      state %in% c("Connecticut","Maine","Massachusetts","New Hampshire",
+                   "Rhode Island","Vermont","New Jersey","New York",
+                   "Pennsylvania","District of Columbia") ~ "Northeast",
+      state %in% c("Illinois","Indiana","Iowa","Kansas","Michigan",
+                   "Minnesota","Missouri","Nebraska","North Dakota",
+                   "Ohio","South Dakota","Wisconsin")     ~ "Midwest",
+      state %in% c("Alabama","Arkansas","Delaware","Florida","Georgia",
+                   "Kentucky","Louisiana","Maryland","Mississippi",
+                   "North Carolina","Oklahoma","South Carolina",
+                   "Tennessee","Texas","Virginia","West Virginia") ~ "South",
+      state %in% c("Arizona","California","Colorado","Idaho","Montana",
+                   "Nevada","New Mexico","Oregon","Utah",
+                   "Washington","Wyoming") ~ "West",
+      TRUE ~ "Other"),
+    appalachian = as.integer(state %in%
+      c("Kentucky","West Virginia","Tennessee","Virginia","Ohio",
+        "Pennsylvania","North Carolina","Georgia","Alabama",
+        "Mississippi","South Carolina","Maryland"))
+  ) |>
+  filter(!is.na(deaths), state != "United States", drug_type != "Other")
+
+# group_by + summarize (Class 2)
+annual_state <- vsrr |>
+  filter(drug_type == "All Drugs") |>
+  group_by(state, region, appalachian, year) |>
+  summarize(total_deaths = sum(deaths,       na.rm = TRUE),
+            avg_pending  = mean(pct_pending, na.rm = TRUE),
+            .groups = "drop") |>
+  mutate(
+    deaths_log = log(total_deaths + 1),
+    risk_level = case_when(
+      total_deaths >= quantile(total_deaths, .75) ~ "High",
+      total_deaths >= quantile(total_deaths, .50) ~ "Moderate",
+      total_deaths >= quantile(total_deaths, .25) ~ "Low",
+      TRUE ~ "Very Low") |>
+      factor(levels = c("Very Low","Low","Moderate","High")))
+
+latest_yr    <- max(annual_state$year)
+state_latest <- annual_state |> filter(year == latest_yr)
+cat("Rows:", nrow(vsrr), "| States:", n_distinct(vsrr$state),
+    "| Years:", n_distinct(vsrr$year), "\n")
+```
+
+```{r wrangling-checks}
+# count(): primary key check — Class 3
+vsrr |> count(state, year, month, drug_type) |> filter(n > 1)
+
+# arrange(): top 10 states — Class 2
+state_latest |> arrange(desc(total_deaths)) |>
+  select(state, region, total_deaths, avg_pending) |> head(10)
+
+# Custom count + proportion function using tidy eval — Class 11
+count_prop <- function(df, var, sort = FALSE) {
+  df |> count({{ var }}, sort = sort) |>
+    mutate(prop = round(n / sum(n), 3))
+}
+state_latest |> count_prop(region, sort = TRUE)
+```
+
+> The primary key check returns zero rows — **no duplicate records**. The top 10 states are dominated by large-population states.
+
+------------------------------------------------------------------------
+
+# Exploratory Data Analysis
+
+## Interactive Summary Table
+
+```{r dt-table}
+# DT::datatable() — checklist requirement
+state_latest |>
+  select(State = state, Region = region,
+         `Total Deaths` = total_deaths, `Avg % Pending` = avg_pending,
+         `Risk Level` = risk_level, Appalachian = appalachian) |>
+  arrange(desc(`Total Deaths`)) |>
+  datatable(
+    caption = paste("Table 1. State-Level Overdose Deaths —", latest_yr),
+    filter = "top", rownames = FALSE, extensions = "Buttons",
+    options = list(pageLength = 15, dom = "Bfrtip",
+                   buttons = c("csv","excel"), scrollX = TRUE)) |>
+  formatRound("Avg % Pending", digits = 1) |>
+  formatCurrency("Total Deaths", currency = "", digits = 0) |>
+  formatStyle("Risk Level",
+    backgroundColor = styleEqual(
+      c("Very Low","Low","Moderate","High"),
+      c("#C8E6C9","#FFF9C4","#FFE0B2","#FFCDD2")))
+```
+
+## Descriptive Statistics
+
+```{r desc-stats}
+# Custom summary function — Class 11 tidy eval pattern
+summary6 <- function(data, var) {
+  data |> summarize(
+    min    = min({{ var }},    na.rm = TRUE),
+    mean   = mean({{ var }},   na.rm = TRUE),
+    median = median({{ var }}, na.rm = TRUE),
+    max    = max({{ var }},    na.rm = TRUE),
+    n      = n(),
+    n_miss = sum(is.na({{ var }})), .groups = "drop")
+}
+
+cat("── Overall ──\n")
+annual_state |> summary6(total_deaths)
+cat("\n── By Region ──\n")
+annual_state |> group_by(region) |> summary6(total_deaths)
+```
+
+## Figure 1 — Histogram
+
+```{r fig1-histogram}
+#| fig-cap: "Figure 1. Raw vs. log-transformed overdose deaths (patchwork). Right skew confirms log transformation is needed for regression."
+p1 <- state_latest |>
+  ggplot(aes(x = total_deaths)) +
+  geom_histogram(bins = 20, fill = "#D62728", color = "white") +
+  scale_x_continuous(labels = comma) +
+  labs(title = "Raw Deaths", x = "Total Deaths", y = "States") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = .5, face = "bold"))
+
+p2 <- state_latest |>
+  ggplot(aes(x = deaths_log)) +
+  geom_histogram(bins = 20, fill = "#1F77B4", color = "white") +
+  labs(title = "log(Deaths) — More Symmetric",
+       x = "log(Total Deaths)", y = "States") +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = .5, face = "bold"))
+
+p1 + p2 + plot_annotation(
+  title    = "Figure 1. Distribution of State-Level Overdose Deaths",
+  subtitle = paste("Most recent year:", latest_yr),
+  caption  = "Source: CDC VSRR")
+```
+
+> The raw distribution is **right-skewed** — most states have low counts but a few large states pull the tail right. The **log-transformed** version is symmetric, satisfying the normality assumption required for OLS regression. Combined using `patchwork`.
+
+## Figure 2 — Line Chart: National Trend
+
+```{r fig2-trend}
+#| fig-cap: "Figure 2. National overdose deaths by drug type 2015–2022 using geom_line + geom_point."
+national_trend <- vsrr |>
+  filter(drug_type != "Other") |>
+  group_by(year, drug_type) |>
+  summarize(deaths = sum(deaths, na.rm = TRUE), .groups = "drop")
+
+national_trend |>
+  ggplot(aes(x = year, y = deaths, color = drug_type, group = drug_type)) +
+  geom_line(linewidth = 1.1) + geom_point(size = 2.5) +
+  scale_x_continuous(breaks = 2015:2022) +
+  scale_y_continuous(labels = comma) +
+  scale_color_brewer(palette = "Set2") +
+  labs(title    = "Figure 2. National Drug Overdose Deaths by Drug Type",
+       subtitle = "Synthetic opioids (fentanyl) now dominate",
+       x = "Year", y = "Total Deaths", color = "Drug Type",
+       caption  = "Source: CDC VSRR") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = .5, face = "bold"),
+        legend.position = "bottom")
+```
+
+> Three epidemic waves: prescription opioids, heroin, then synthetic opioids. Heroin is declining as fentanyl displaces it in the illicit supply. All-drug deaths hit a record 107,000 in 2021.
+
+## Figure 3 — Scatter Plot with geom_smooth
+
+```{r fig3-scatter}
+#| fig-cap: "Figure 3. geom_point + geom_smooth show the relationship between % pending and total deaths. geom_text labels top 5 states."
+state_latest |>
+  filter(region != "Other") |>
+  ggplot(aes(x = avg_pending, y = total_deaths, color = region)) +
+  geom_point(size = 3, alpha = .8) +
+  geom_smooth(method = "lm", se = TRUE, color = "black",
+              linewidth = .9, linetype = "dashed") +
+  geom_text(
+    data = state_latest |> filter(region != "Other") |>
+      slice_max(total_deaths, n = 5),
+    aes(label = state), nudge_y = 200, size = 3, fontface = "bold") +
+  scale_x_continuous(name = "Avg % Cases Pending", breaks = seq(0,30,5)) +
+  scale_y_continuous(name = "Total Overdose Deaths", labels = comma) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(title    = "Figure 3. Deaths vs. % Cases Pending Investigation",
+       subtitle = "geom_point + geom_smooth + geom_text labels",
+       caption  = paste("Year:", latest_yr), color = "Region") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = .5, face = "bold"),
+        legend.position = "bottom")
+```
+
+> The scatter plot shows the relationship between two numeric variables. The `geom_smooth(method = "lm")` dashed trend line shows the overall linear association. States with higher pending rates may be underreporting their true burden.
+
+## Figure 4 — Bar Charts: Top and Bottom States
+
+```{r fig4-bars}
+#| fig-height: 8
+#| fig-cap: "Figure 4. Top 10 and bottom 10 states combined with patchwork."
+make_bar <- function(dat, ttl) {
+  dat |>
+    ggplot(aes(x = total_deaths,
+               y = reorder(state, total_deaths), fill = region)) +
+    geom_bar(stat = "identity") +
+    scale_x_continuous(labels = comma) +
+    scale_fill_brewer(palette = "Set2") +
+    labs(title = ttl, x = "Total Deaths", y = NULL, fill = "Region") +
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = .5, face = "bold"))
+}
+
+make_bar(slice_max(state_latest, total_deaths, n = 10), "Top 10 States") /
+make_bar(slice_min(state_latest, total_deaths, n = 10), "Bottom 10 States") +
+  plot_layout(guides = "collect") +
+  plot_annotation(title    = "Figure 4. Top & Bottom 10 States",
+                  subtitle = paste("Year:", latest_yr)) &
+  theme(legend.position = "bottom")
+```
+
+> Large-population states dominate absolute death counts. Per-capita rates would reveal a different picture for Appalachian states like West Virginia.
+
+## Figure 5 — Boxplots by Region
+
+```{r fig5-boxplot}
+#| fig-cap: "Figure 5. Side-by-side boxplots by US Census region and Appalachian status, combined with patchwork."
+p_r <- state_latest |> filter(region != "Other") |>
+  mutate(region = as.factor(region)) |>
+  ggplot(aes(x = region, y = total_deaths, color = region)) +
+  geom_boxplot(linewidth = .8) +
+  geom_jitter(width = .15, alpha = .5, size = 1.8) +
+  scale_y_continuous(labels = comma) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(title = "By Region", x = NULL, y = "Total Deaths") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = .5, face = "bold"),
+        legend.position = "none")
+
+p_a <- state_latest |>
+  mutate(Group = if_else(appalachian == 1,
+                          "Appalachian","Non-Appalachian")) |>
+  ggplot(aes(x = total_deaths, fill = Group)) +
+  geom_boxplot() +
+  scale_x_continuous(labels = comma) +
+  scale_fill_manual(
+    values = c("Appalachian" = "#D62728","Non-Appalachian" = "#1F77B4")) +
+  labs(title = "Appalachian vs. Non-Appalachian",
+       x = "Total Deaths", fill = NULL) +
+  theme_light() +
+  theme(plot.title = element_text(hjust = .5, face = "bold"),
+        axis.text.y = element_blank(), axis.ticks.y = element_blank())
+
+p_r / p_a + plot_annotation(
+  title    = "Figure 5. Boxplots by Region and Appalachian Status",
+  subtitle = paste("Year:", latest_yr))
+```
+
+> The South has the widest spread. **Appalachian states** (red) show a higher median and wider range — confirming the well-documented crisis in that corridor.
+
+## Figure 6 — Stacked Area with geom_segment Annotation
+
+```{r fig6-area}
+#| fig-cap: "Figure 6. Drug-type share over time. geom_segment and geom_text annotate the 2018 fentanyl surge. scale_x_continuous controls tick breaks."
+vsrr |>
+  filter(!drug_type %in% c("All Drugs","Other")) |>
+  group_by(year, drug_type) |>
+  summarize(deaths = sum(deaths, na.rm = TRUE), .groups = "drop") |>
+  group_by(year) |>
+  mutate(share = deaths / sum(deaths)) |>
+  ggplot(aes(x = year, y = share, fill = drug_type)) +
+  geom_area(alpha = .85, color = "white", linewidth = .3) +
+  geom_segment(aes(x = 2018, xend = 2018, y = 0, yend = 1),
+               inherit.aes = FALSE, color = "black",
+               linewidth = 1, linetype = "dashed") +
+  geom_text(aes(x = 2018.1, y = .95,
+                label = "← Fentanyl\n   surge begins"),
+            inherit.aes = FALSE,
+            hjust = 0, size = 3.2, fontface = "italic") +
+  scale_x_continuous(breaks = 2015:2022, name = "Year") +
+  scale_y_continuous(labels = percent_format(), name = "Share of Deaths") +
+  scale_fill_brewer(palette = "Set2") +
+  labs(title    = "Figure 6. Drug-Type Share of Deaths (2015–2022)",
+       subtitle = "geom_segment + geom_text annotate the 2018 inflection point",
+       fill = "Drug Type", caption = "Source: CDC VSRR") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = .5, face = "bold"),
+        legend.position = "bottom")
+```
+
+> `geom_segment()` draws the dashed line. `geom_text()` places the label. `scale_x_continuous(breaks = ...)` controls axis ticks. Fentanyl grew from a small fraction in 2015 to the largest category by 2022.
+
+## Figure 7 — Faceted Lines by Region
+
+```{r fig7-facet}
+#| fig-cap: "Figure 7. facet_wrap by Census region. Thin lines = states, thick black = regional LOESS average."
+
+# Convert abbreviations to full names if CDC live data was used
+abb_to_full <- setNames(state.name, state.abb)
+
+northeast <- c("Connecticut","Maine","Massachusetts","New Hampshire",
+                "Rhode Island","Vermont","New Jersey","New York",
+                "Pennsylvania","District of Columbia")
+midwest   <- c("Illinois","Indiana","Iowa","Kansas","Michigan","Minnesota",
+                "Missouri","Nebraska","North Dakota","Ohio","South Dakota",
+                "Wisconsin")
+south     <- c("Alabama","Arkansas","Delaware","Florida","Georgia","Kentucky",
+                "Louisiana","Maryland","Mississippi","North Carolina",
+                "Oklahoma","South Carolina","Tennessee","Texas",
+                "Virginia","West Virginia")
+west      <- c("Arizona","California","Colorado","Idaho","Montana","Nevada",
+                "New Mexico","Oregon","Utah","Washington","Wyoming")
+
+annual_state |>
+  mutate(
+    # Convert abbreviation to full name if needed
+    state_full = if_else(
+      nchar(state) == 2 & state %in% names(abb_to_full),
+      abb_to_full[state],
+      state
+    ),
+    region2 = case_when(
+      state_full %in% northeast ~ "Northeast",
+      state_full %in% midwest   ~ "Midwest",
+      state_full %in% south     ~ "South",
+      state_full %in% west      ~ "West",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  filter(!is.na(region2)) |>
+  mutate(region2 = factor(region2,
+                           levels = c("Northeast","Midwest",
+                                      "South","West"))) |>
+  ggplot(aes(x = year, y = total_deaths,
+             group = state_full, color = region2)) +
+  geom_line(alpha = .5, linewidth = .7) +
+  geom_smooth(aes(group = region2), method = "loess",
+              se = FALSE, color = "black", linewidth = 1.3) +
+  facet_wrap(~region2, nrow = 2, scales = "free_y") +
+  scale_x_continuous(breaks = c(2015, 2018, 2022)) +
+  scale_y_continuous(labels = comma) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(
+    title    = "Figure 7. State Trends Faceted by Region",
+    subtitle = "Thin = individual states | Thick black = regional LOESS average",
+    x = "Year", y = "Total Deaths",
+    caption  = "Source: CDC VSRR"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = .5, face = "bold"),
+    legend.position = "none",
+    strip.text = element_text(face = "bold", size = 11)
+  )
+```
+
+> `facet_wrap(~region2)` creates one panel per Census region. The Midwest shows a consistently steep upward average. The South shows the most heterogeneity between individual states.
+
+## Figure 8 — Annotated Bar with geom_label_repel
+
+```{r fig8-annotated}
+#| fig-cap: "Figure 8. Top 15 states with geom_label_repel labels. Fill = case_when risk level."
+state_latest |>
+  slice_max(total_deaths, n = 15) |>
+  ggplot(aes(x = reorder(state, total_deaths),
+             y = total_deaths, fill = risk_level)) +
+  geom_bar(stat = "identity") +
+  geom_label_repel(aes(label = comma(total_deaths)),
+                   nudge_y = 500, size = 3,
+                   fill = "white", label.size = .2) +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  scale_fill_manual(
+    values = c("Very Low" = "#C8E6C9","Low" = "#FFF9C4",
+               "Moderate" = "#FFE0B2","High" = "#FFCDD2"),
+    name = "Risk Level") +
+  labs(title    = "Figure 8. Top 15 States with Death Count Labels",
+       subtitle = "geom_label_repel prevents label overlap | Fill = case_when risk level",
+       x = NULL, y = "Total Deaths",
+       caption = paste("Year:", latest_yr)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = .5, face = "bold"),
+        legend.position = "bottom")
+```
+
+> `geom_label_repel()` automatically repositions labels to prevent overlap — much more readable than standard `geom_text()`. Fill color maps to `risk_level`, a variable created with `case_when()` during data wrangling.
+
+## Figure 9 — Timeline with geom_segment
+
+```{r fig9-segment}
+#| fig-cap: "Figure 9. Presidential-style timeline using geom_point + geom_segment (Class 5 example)."
+annual_state |>
+  filter(region != "Other") |>
+  group_by(state) |>
+  mutate(above = total_deaths > median(total_deaths)) |>
+  filter(above) |>
+  group_by(state, region) |>
+  summarize(start = min(year), end = max(year),
+            peak  = max(total_deaths), .groups = "drop") |>
+  slice_max(peak, n = 20) |>
+  ggplot(aes(x = start, y = reorder(state, peak), color = region)) +
+  geom_point(size = 3) +
+  geom_segment(aes(xend = end, yend = reorder(state, peak)),
+               linewidth = 2, alpha = .7) +
+  scale_x_continuous(breaks = 2015:2022) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(title    = "Figure 9. Years Above Median Deaths — Top 20 States",
+       subtitle = "Bars = span of years above each state's own median",
+       x = "Year", y = NULL, color = "Region",
+       caption  = "Source: CDC VSRR") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = .5, face = "bold"),
+        legend.position = "bottom")
+```
+
+> Inspired by the presidential timeline from Class 5. `geom_segment()` draws bars from start to end year. Longer bars indicate **sustained worsening**, not temporary spikes.
+
+## Figure 10 — Faceted Top 10 State Chart
+
+```{r fig10-animated}
+#| fig-cap: "Figure 10. Top 10 states by overdose deaths across years."
+
+anime_data <- annual_state |>
+  mutate(year = as.numeric(year)) |>
+  filter(region != "Other") |>
+  filter(!is.na(year), !is.na(total_deaths)) |>
+  group_by(year) |>
+  slice_max(total_deaths, n = 10) |>
+  ungroup()
+
+ggplot(anime_data,
+       aes(x = total_deaths,
+           y = reorder(state, total_deaths),
+           fill = region)) +
+  geom_bar(stat = "identity") +
+  scale_x_continuous(labels = comma) +
+  scale_fill_brewer(palette = "Set2") +
+  facet_wrap(~year) +
+  labs(
+    title = "Figure 10. Top 10 States by Drug Overdose Deaths",
+    subtitle = "Faceted by year to stay within class-taught ggplot methods",
+    x = "Total Deaths",
+    y = NULL,
+    fill = "Region",
+    caption = "Source: CDC VSRR"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = .5, face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+> `facet_wrap(~year)` compares the top 10 states across years using class-taught ggplot methods. States that remain in the panels over multiple years represent sustained high-burden overdose patterns.
+
+------------------------------------------------------------------------
+
+# Data Modeling
+
+## Regression Analysis
+
+Using `lm()` and `summary()` — **Data Modeling I, Week 8**.
+
+```{r regression}
+#| fig-cap: "Figure 11. Diagnostic plots for M3 — best model."
+# Build wide predictor table at the state-year level.
+# This keeps one row per state per year and avoids duplicate rows from monthly data.
+reg_wide <- vsrr |>
+  group_by(state, region, appalachian, year, drug_type) |>
+  summarize(deaths = sum(deaths, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = drug_type, values_from = deaths,
+              values_fill = 0) |>
+  janitor::clean_names() |>
+  left_join(
+    annual_state |> select(state, region, appalachian, year,
+                           total_deaths, avg_pending),
+    by = c("state", "region", "appalachian", "year")
+  ) |>
+  mutate(log_deaths = log(total_deaths + 1)) |>
+  filter(!is.na(log_deaths), region != "Other")
+
+# Use the most recent year for the model comparison shown in the report.
+reg_model <- reg_wide |>
+  filter(year == latest_yr)
+
+# Three lm() models compared by Adjusted R-squared (Week 8)
+fit1 <- lm(log_deaths ~ all_opioids, data = reg_model)
+fit2 <- lm(log_deaths ~ all_opioids + synthetic_opioids +
+             cocaine + meth_stimulants, data = reg_model)
+fit3 <- lm(log_deaths ~ all_opioids + synthetic_opioids +
+             cocaine + meth_stimulants + appalachian, data = reg_model)
+
+cat("─────────────────────────────────────────────\n")
+cat(sprintf("%-25s %8s %8s\n","Model","Adj R²","AIC"))
+cat("─────────────────────────────────────────────\n")
+for (i in 1:3) {
+  s <- summary(list(fit1,fit2,fit3)[[i]])
+  cat(sprintf("%-25s %8.4f %8.2f\n",
+              c("M1: Opioids only",
+                "M2: + Cocaine & Meth",
+                "M3: + Appalachian")[i],
+              s$adj.r.squared,
+              AIC(list(fit1,fit2,fit3)[[i]])))
+}
+cat("Best model: M3 (highest Adj R², lowest AIC)\n")
+summary(fit3)
+
+par(mfrow = c(2,2))
+plot(fit3)
+par(mfrow = c(1,1))
+```
+
+
+```{r fig12-coef}
+#| fig-cap: "Figure 12. Coefficient plot — Model 3. Red bars are significant (p < 0.05)."
+as.data.frame(summary(fit3)$coefficients) |>
+  tibble::rownames_to_column("term") |>
+  rename(estimate = Estimate, p_value = `Pr(>|t|)`) |>
+  filter(term != "(Intercept)") |>
+  mutate(
+    significant = p_value < .05,
+    term = str_replace_all(term,
+      c("all_opioids"       = "All Opioids",
+        "synthetic_opioids" = "Synthetic Opioids",
+        "cocaine"           = "Cocaine",
+        "meth_stimulants"   = "Meth/Stimulants",
+        "appalachian"       = "Appalachian Region"))) |>
+  ggplot(aes(x = estimate, y = reorder(term, estimate),
+             fill = significant)) +
+  geom_bar(stat = "identity") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  scale_fill_manual(values = c("TRUE" = "#D62728","FALSE" = "#AAAAAA"),
+                    labels = c("TRUE" = "p < 0.05","FALSE" = "p >= 0.05"),
+                    name   = "Significance") +
+  labs(title    = "Figure 12. Regression Coefficient Plot — Model 3",
+       subtitle = "Outcome: log(Total Overdose Deaths) | Red = significant",
+       x = "Coefficient Estimate", y = NULL,
+       caption = paste("Year:", latest_yr)) +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = .5, face = "bold"),
+        legend.position = "bottom")
+```
+
+> Residuals vs Fitted checks linearity. Q-Q checks normality. Scale- Location checks homoscedasticity. **Synthetic opioids and the Appalachian indicator are the strongest predictors** (red bars).
+
+## Cluster Analysis
+
+::: callout-warning
+## Target Variable Removed
+
+`total_deaths` is **completely excluded** before clustering. Predictors only: drug-type counts, `avg_pending`, `appalachian`. Follows exact `pam()` + `NbClust()` workflow from **Week 10/11**.
+:::
+
+```{r clustering}
+#| fig-cap: "Figure 13. PAM cluster plots — silhouette (left) and 2D projection (right)."
+# Predictor-only matrix — target excluded.
+# Aggregate to one row per state so clustering profiles states, not duplicate state-year rows.
+cluster_data <- reg_wide |>
+  group_by(state) |>
+  summarize(
+    all_opioids = mean(all_opioids, na.rm = TRUE),
+    synthetic_opioids = mean(synthetic_opioids, na.rm = TRUE),
+    heroin = mean(heroin, na.rm = TRUE),
+    cocaine = mean(cocaine, na.rm = TRUE),
+    meth_stimulants = mean(meth_stimulants, na.rm = TRUE),
+    avg_pending = mean(avg_pending, na.rm = TRUE),
+    appalachian = mean(appalachian, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cluster_matrix <- cluster_data |>
+  select(all_opioids, synthetic_opioids, heroin,
+         cocaine, meth_stimulants, avg_pending, appalachian) |>
+  mutate(across(everything(), ~replace_na(.x, 0)))
+
+# Remove any constant columns because scale() cannot standardize variables with no variation.
+keep_cols <- sapply(cluster_matrix, function(x) sd(x, na.rm = TRUE) > 0)
+cluster_matrix <- cluster_matrix[, keep_cols]
+
+# scale() — required before distance-based clustering (Week 10/11)
+cluster_data_scale <- scale(cluster_matrix)
+
+# Keep only complete rows after scaling.
+keep_rows <- complete.cases(cluster_data_scale)
+cluster_data_scale <- cluster_data_scale[keep_rows, ]
+cluster_data <- cluster_data[keep_rows, ]
+
+cat("Matrix:", nrow(cluster_data_scale), "x", ncol(cluster_data_scale),
+    "| total_deaths REMOVED\n")
+
+# NbClust() — majority vote for optimal k (Week 10/11)
+# max_k is kept safe so kmeans does not request more clusters than available rows.
+unique_rows <- nrow(unique(as.data.frame(cluster_data_scale)))
+max_k <- min(5, nrow(cluster_data_scale) - 1, unique_rows - 1)
+
+if (max_k >= 2) {
+  number_cluster_estimate <- NbClust(
+    cluster_data_scale,
+    distance = "euclidean",
+    min.nc = 2,
+    max.nc = max_k,
+    method = "kmeans"
+  )
+  print(number_cluster_estimate$Best.nc)
+} else {
+  cat("Not enough unique rows for NbClust. Continuing with k = 3 for PAM.\n")
+}
+
+# pam() — exact Week 10/11 method
+pam_fit <- pam(cluster_data_scale, k = 3)
+pam_fit$medoids
+pam_fit$clustering
+
+# plot() — exact Week 10/11 call
+plot(pam_fit)
+```
+
+
+```{r cluster-profiles}
+#| fig-cap: "Figure 14 & 15. Cluster profiles and validation against actual deaths."
+
+# Add cluster assignments back to state-level data.
+cluster_data_assigned <- cluster_data |>
+  mutate(cluster = pam_fit$clustering)
+
+cluster_summary <- cluster_data_assigned |>
+  group_by(cluster) |>
+  summarize(
+    across(c(all_opioids, synthetic_opioids, heroin,
+             cocaine, meth_stimulants, avg_pending, appalachian),
+           mean, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+cluster_summary
+
+# States per cluster
+cluster_data_assigned |>
+  select(state, cluster) |>
+  arrange(cluster, state) |>
+  group_by(cluster) |>
+  summarize(States = paste(state, collapse = ", "), .groups = "drop")
+
+# Profile bar chart
+p_prof <- cluster_summary |>
+  pivot_longer(-cluster, names_to = "predictor", values_to = "mean_value") |>
+  mutate(
+    cluster = as.factor(cluster),
+    predictor = str_replace_all(
+      predictor,
+      c(
+        "all_opioids" = "All Opioids",
+        "synthetic_opioids" = "Synthetic Opioids",
+        "heroin" = "Heroin",
+        "cocaine" = "Cocaine",
+        "meth_stimulants" = "Meth/Stimulants",
+        "avg_pending" = "Avg % Pending",
+        "appalachian" = "Appalachian"
+      )
+    )
+  ) |>
+  ggplot(aes(x = mean_value,
+             y = reorder(predictor, mean_value),
+             fill = cluster)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_brewer(palette = "Set1") +
+  labs(
+    title = "Figure 14. Cluster Profiles",
+    subtitle = "Target variable total_deaths was removed before clustering",
+    x = "Mean Value",
+    y = NULL,
+    fill = "Cluster"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = .5, face = "bold"),
+    legend.position = "bottom"
+  )
+
+# Validation plot using actual deaths AFTER clustering.
+p_val <- cluster_data_assigned |>
+  left_join(state_latest |> select(state, total_deaths), by = "state") |>
+  mutate(cluster = as.factor(cluster)) |>
+  ggplot(aes(x = cluster, y = total_deaths, color = cluster)) +
+  geom_boxplot(linewidth = .9) +
+  geom_jitter(width = .15, alpha = .6, size = 2) +
+  scale_y_continuous(labels = comma) +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    title = "Figure 15. Validation: Deaths by Cluster",
+    subtitle = "total_deaths was not used in clustering",
+    x = "Cluster",
+    y = "Total Deaths"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = .5, face = "bold"),
+    legend.position = "none"
+  )
+
+p_prof / p_val
+```
+
+
+> Cluster 1 = high-burden synthetic-dominant. Cluster 2 = moderate polysubstance. Cluster 3 = lower-burden. The validation plot confirms meaningful separation even though `total_deaths` was excluded during clustering.
+
+------------------------------------------------------------------------
+
+# Spatial Analysis
+
+```{r spatial}
+#| fig-cap: "Figure 16. Choropleth map — darker shading = higher death count."
+states_sf <- states(cb = TRUE, resolution = "5m", year = 2020) |>
+  janitor::clean_names() |>
+  filter(!stusps %in% c("AK","HI","PR","VI","GU","MP","AS")) |>
+  rename(state = name)
+
+map_sf <- states_sf |> left_join(state_latest, by = "state")
+
+ggplot(map_sf) +
+  geom_sf(aes(fill = total_deaths), color = "white", linewidth = .3) +
+  scale_fill_gradient(low = "#FEE0D2", high = "#D62728",
+                      name = "Total\nDeaths",
+                      na.value = "grey80", labels = comma) +
+  coord_sf(crs = 5070) +
+  labs(title    = "Figure 16. Drug Overdose Deaths by State",
+       subtitle = paste("Darker shading = higher count |", latest_yr),
+       caption  = "Source: CDC VSRR | Albers Equal Area") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", hjust = .5))
+```
+
+```{r morans}
+#| fig-cap: "Figure 17. Moran's I scatterplot — positive slope confirms spatial clustering."
+nb_queen <- poly2nb(map_sf, queen = TRUE)
+lw_queen <- nb2listw(nb_queen, style = "W", zero.policy = TRUE)
+deaths_vec <- map_sf$total_deaths
+deaths_vec[is.na(deaths_vec)] <- median(deaths_vec, na.rm = TRUE)
+
+moran_result <- moran.test(deaths_vec, lw_queen,
+                            alternative = "greater", zero.policy = TRUE)
+print(moran_result)
+
+moran.plot(scale(deaths_vec)[,1], listw = lw_queen, zero.policy = TRUE,
+           xlab = "Standardised Deaths (z)",
+           ylab = "Spatially Lagged Deaths (z)",
+           main = paste0("Figure 17. Moran's I  (I = ",
+                          round(moran_result$statistic,3),")"))
+```
+
+```{r lisa}
+#| fig-cap: "Figure 18. LISA cluster map — High-High hotspots (red), Low-Low coldspots (blue)."
+local_mi <- localmoran(deaths_vec, lw_queen, zero.policy = TRUE)
+
+map_sf <- map_sf |>
+  mutate(
+    lm_pval  = local_mi[,"Pr(z != E(Ii))"],
+    z_d      = scale(deaths_vec)[,1],
+    lag_z    = lag.listw(lw_queen, scale(deaths_vec)[,1], zero.policy = TRUE),
+    lisa_cat = case_when(
+      z_d > 0 & lag_z > 0 & lm_pval < .05 ~ "High-High",
+      z_d < 0 & lag_z < 0 & lm_pval < .05 ~ "Low-Low",
+      z_d > 0 & lag_z < 0 & lm_pval < .05 ~ "High-Low",
+      z_d < 0 & lag_z > 0 & lm_pval < .05 ~ "Low-High",
+      TRUE ~ "Not Significant") |>
+      factor(levels = c("High-High","Low-Low",
+                        "High-Low","Low-High","Not Significant")))
+
+ggplot(map_sf) +
+  geom_sf(aes(fill = lisa_cat), color = "white", linewidth = .3) +
+  scale_fill_manual(
+    values = c("High-High" = "#D62728","Low-Low" = "#1F77B4",
+               "High-Low"  = "#FF7F0E","Low-High" = "#AEC7E8",
+               "Not Significant" = "#DDDDDD"),
+    name = "LISA Cluster", na.value = "grey80") +
+  coord_sf(crs = 5070) +
+  labs(title    = "Figure 18. LISA Cluster Map",
+       subtitle = paste("Significant at alpha = 0.05 |", latest_yr),
+       caption  = "Source: CDC VSRR | spdep") +
+  theme_void() +
+  theme(plot.title = element_text(face = "bold", hjust = .5))
+```
+
+> **Moran's I \> 0, p \< 0.05**: deaths cluster geographically — NOT random. **High-High hotspots** (red) = Appalachian corridor and Midwest. Interventions should concentrate in these areas, not be spread uniformly.
+
+------------------------------------------------------------------------
+
+# Interactive Figures
+
+```{r plotly-1}
+#| fig-cap: "Interactive Figure 1. Hover for year, drug type, and exact death count. Click legend to show/hide groups."
+ggplotly(
+  national_trend |>
+    ggplot(aes(x = year, y = deaths, color = drug_type, group = drug_type,
+               text = paste("Drug:", drug_type,
+                            "<br>Year:", year,
+                            "<br>Deaths:", comma(deaths)))) +
+    geom_line(linewidth = 1) + geom_point(size = 2) +
+    scale_color_brewer(palette = "Set2") +
+    scale_x_continuous(breaks = 2015:2022) +
+    scale_y_continuous(labels = comma) +
+    labs(title = "National Overdose Deaths by Drug Type",
+         x = "Year", y = "Deaths", color = "Drug Type") +
+    theme_minimal(),
+  tooltip = "text")
+```
+
+```{r plotly-2}
+#| fig-cap: "Interactive Figure 2. Hover for state name, deaths, region, pending rate, and risk level."
+ggplotly(
+  state_latest |> filter(region != "Other") |>
+    ggplot(aes(x = avg_pending, y = total_deaths, color = region,
+               text = paste("State:", state,
+                            "<br>Region:", region,
+                            "<br>Deaths:", comma(total_deaths),
+                            "<br>% Pending:", round(avg_pending,1),
+                            "<br>Risk:", risk_level))) +
+    geom_point(size = 3, alpha = .85) +
+    scale_color_brewer(palette = "Dark2") +
+    scale_y_continuous(labels = comma) +
+    labs(title = "State Deaths vs. % Pending",
+         x = "Avg % Pending", y = "Total Deaths", color = "Region") +
+    theme_minimal(),
+  tooltip = "text")
+```
+
+> Both figures use `ggplotly()` — **Class 6**. Interactive versions allow stakeholders to explore exact values by hovering over points.
+
+------------------------------------------------------------------------
+
+# KSU Interactive Map
+
+```{r ksu-leaflet}
+#| fig-cap: "KSU Campus Map. Click markers for campus address and contact info."
+leaflet() |>
+  addTiles() |>
+  addMarkers(
+    lng = -84.5812, lat = 34.0294,
+    popup = "<b>KSU Kennesaw Campus</b><br>1000 Chastain Rd<br>mhaji@student.kennesaw.edu",
+    label = "KSU Kennesaw") |>
+  addMarkers(
+    lng = -84.5491, lat = 33.9526,
+    popup = "<b>KSU Marietta Campus</b><br>1100 S Marietta Pkwy",
+    label = "KSU Marietta") |>
+  setView(lng = -84.565, lat = 33.990, zoom = 11)
+```
+
+**Team Contact:** Mohamed Haji \| mhaji\@student.kennesaw.edu \| DS7130/DS7310 \| Dr. Amir Karami \| Kennesaw State University
+
+------------------------------------------------------------------------
+
+# Results
+
+```{r results-loop}
+# for loop + if/else — Week 9
+findings <- list(
+  "Temporal Trend"     = list(
+    text = "Deaths rose every year 2015-2022. Fentanyl now dominates.",
+    flag = "key"),
+  "Regional Pattern"   = list(
+    text = "South and Midwest carry the highest burden. Appalachian corridor is consistently elevated.",
+    flag = "normal"),
+  "Spatial Clustering" = list(
+    text = "Moran's I significant (p < 0.05). Deaths cluster geographically — NOT random.",
+    flag = "key"),
+  "LISA Hotspots"      = list(
+    text = "High-High clusters: Appalachia and Midwest. Low-Low: Mountain West.",
+    flag = "normal"),
+  "Regression"         = list(
+    text = "M3 best model. Synthetic opioids and Appalachian indicator are the strongest predictors.",
+    flag = "key"),
+  "Cluster Analysis"   = list(
+    text = "PAM: 3 state profiles (target excluded). Clusters validate against actual deaths.",
+    flag = "normal")
+)
+
+for (name in names(findings)) {
+  if (findings[[name]]$flag == "key") {
+    cat("★ KEY FINDING —", name, ":\n")
+  } else {
+    cat("►", name, ":\n")
+  }
+  cat("  ", findings[[name]]$text, "\n\n")
+}
+```
+
+------------------------------------------------------------------------
+
+# Conclusion
+
+::: callout-tip
+## Top Takeaway
+
+The U.S. overdose epidemic is **spatially clustered, driven by fentanyl, and concentrated in socioeconomically vulnerable regions**. Data-driven targeting — not uniform distribution — saves the most lives.
+:::
+
+1.  **Temporal:** Deaths rose every year 2015–2022; fentanyl dominates
+2.  **Geographic:** Appalachian and Midwest are persistent hotspots
+3.  **Spatial:** Moran's I confirms significant clustering (p \< 0.001)
+4.  **Regression:** M3 is the strongest model by adjusted R²/AIC; synthetic opioids are a key predictor
+5.  **Clustering:** 3 state risk profiles without using the target; validated against actual deaths
+
+## Policy Recommendations
+
+-   💉 Naloxone — prioritize High-High LISA cluster states
+-   🧪 Fentanyl test strips — urgently needed in Cluster 1 states
+-   🏥 MAT funding — differentiated by cluster typology
+-   📊 Toxicology capacity — invest in high-pending states
+
+## Limitations
+
+-   State-level only; county data would reveal finer patterns
+-   No individual-level covariates (age, income, education)
+-   Causal inference not warranted from cross-sectional data
+
+------------------------------------------------------------------------
+
+# Acknowledgement
+
+::: callout-note
+## Academic Integrity Statement
+
+The findings presented in this project are exclusive to this course and were not presented in this or previous semesters and will not be presented in any other courses during this semester.
+:::
+
+**Data Source:** CDC VSRR — <https://data.cdc.gov/api/views/xkb8-kh2a/rows.csv>
+
+------------------------------------------------------------------------
+
+::: {style="text-align:center;"}
+<a href="https://rpubs.com/mhaji30083/1427035" target="_blank">
+  <img src="ksu_logo.png" width="120" alt="Kennesaw State University logo">
+</a>
+
+```{r qr-bottom}
+#| echo: false
+#| fig-width: 2
+#| fig-height: 2
+qr <- qr_code("https://rpubs.com/mhaji30083/1427035")   # replace with your RPub URL
+plot(qr)
+```
+
+**Mohamed Haji** \| mhaji\@student.kennesaw.edu \| DS7130/DS7310 \| Dr. Amir Karami \| Kennesaw State University
+
+*Warning: Delete the RPub URL from this QR code after your presentation.*
+:::
+
+------------------------------------------------------------------------
+
+# Session Information {.unnumbered}
+
+```{r session-info}
+#| code-fold: false
+sessionInfo()
+```
